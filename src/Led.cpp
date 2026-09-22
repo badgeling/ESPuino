@@ -15,6 +15,7 @@
 #include "Wlan.h"
 
 #include <WiFi.h>
+#include <atomic>
 #include <esp_task_wdt.h>
 
 #ifdef NEOPIXEL_ENABLE
@@ -29,11 +30,21 @@
 extern t_button gButtons[7]; // next + prev + pplay + rotEnc + button4 + button5 + dummy-button
 extern uint8_t gShutdownButton;
 
-static uint32_t Led_Indicators = 0u;
-static uint8_t Led_savedBrightness;
+static std::atomic<uint32_t> Led_Indicators = 0u;
+// Brightness to restore once night mode / ambient light is switched off again. Deliberately two
+// variables: both modes can be active at the same time, and with a single shared slot the one entered
+// last overwrote the other's value -- leaving the brightness stuck at the inner mode's level after
+// both had been switched off again.
+static uint8_t Led_savedBrightnessNightmode;
+static uint8_t Led_savedBrightnessAmbient;
 
 // global led settings
 static LedSettings gLedSettings;
+
+// the strip buffer bound to FastLED via addLeds(); file-scope (rather than local to Led_Task)
+// so Led_ShowOtaProgress() can draw into it directly while Led_Task is suspended during an
+// OTA upload (see System_PauseTasksDuringUpload())
+static CRGB *leds = nullptr;
 
 TaskHandle_t Led_TaskHandle;
 static void Led_Task(void *parameter);
@@ -55,6 +66,13 @@ AnimationReturnType Animation_Idle(const bool startNewAnimation, CRGBSet &leds);
 AnimationReturnType Animation_Busy(const bool startNewAnimation, CRGBSet &leds);
 AnimationReturnType Animation_Pause(const bool startNewAnimation, CRGBSet &leds);
 AnimationReturnType Animation_Speech(const bool startNewAnimation, CRGBSet &leds);
+AnimationReturnType Animation_Download(const bool startNewAnimation, CRGBSet &leds);
+
+// Pushed by MediaHub via Led_SetDownloadProgress(); Led_Task only ever reads
+// these, it doesn't know MediaHub exists (same arrangement as the
+// LED_INDICATOR flags/gPlayProperties fields other animations key off).
+static bool Led_DownloadActive = false;
+static uint8_t Led_DownloadPercent = 0;
 #endif
 
 #ifdef NEOPIXEL_ENABLE
@@ -75,56 +93,75 @@ bool Led_LoadSettings(LedSettings &settings) {
 	uint8_t nvsNLedBrightness = gPrefsSettings.getUChar("nLedBrightness", 255);
 	if (nvsNLedBrightness != 255) {
 		settings.Led_NightBrightness = nvsNLedBrightness;
+		if (System_GetNightmode()) {
+			// Reloading the settings must not undo the dimming while night mode is still on -- the
+			// initial brightness was already written to Led_Brightness above. Same handling as for the
+			// ambient light below.
+			settings.Led_Brightness = nvsNLedBrightness;
+		}
 		Log_Printf(LOGLEVEL_INFO, restoredInitialBrightnessForNmFromNvs, nvsNLedBrightness);
 	} else {
 		gPrefsSettings.putUChar("nLedBrightness", settings.Led_NightBrightness);
 		Log_Println(wroteNmBrightnessToNvs, LOGLEVEL_ERROR);
 	}
 
+	// Get Atmo LED-brightness from NVS
+	uint8_t nvsALedBrightness = gPrefsSettings.getUChar("aLedBrightness", 255);
+	if (nvsALedBrightness != 255) {
+		settings.Led_AmbientBrightness = nvsALedBrightness;
+		if (settings.Led_AmbientLight) {
+			settings.Led_Brightness = nvsALedBrightness;
+		}
+		Log_Printf(LOGLEVEL_INFO, restoredAtmoBrightnessForNmFromNvs, nvsALedBrightness); // TODO-> other message
+	} else {
+		gPrefsSettings.putUChar("aLedBrightness", settings.Led_AmbientBrightness);
+		Log_Println(wroteAtmoBrightnessToNvs, LOGLEVEL_ERROR); // TODO-> other message
+	}
+
 	// Get the number of indicator LEDs from NVS
-	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", NUM_INDICATOR_LEDS);
+	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", 24); // NUM_INDICATOR_LEDS
 
 	// Get the number of control LEDs from NVS
-	settings.numControlLeds = gPrefsSettings.getUChar("numControl", NUM_CONTROL_LEDS);
+	settings.numControlLeds = gPrefsSettings.getUChar("numControl", 0); // NUM_CONTROL_LEDS
 
 	// Get the number of Led idle dots from NVS
-	settings.numIdleDots = gPrefsSettings.getUChar("numIdleDots", NUM_LEDS_IDLE_DOTS);
+	settings.numIdleDots = gPrefsSettings.getUChar("numIdleDots", 4); // NUM_LEDS_IDLE_DOTS
 	if (settings.numIdleDots == 0) {
 		// avoid division by zero
 		settings.numIdleDots = 4;
 	}
 
 	// Get offset LED pause from NVS
-	settings.offsetLedPause = gPrefsSettings.getBool("offsetPause", OFFSET_PAUSE_LEDS);
+	settings.offsetLedPause = gPrefsSettings.getBool("offsetPause", false); // OFFSET_PAUSE_LEDS
+
+	// Flash all LEDs when an RFID tag was accepted? Off by default.
+	settings.indicateRfidTag = gPrefsSettings.getBool("ledRfidFlash", false);
 
 	// get dimmableStates from NVS
-	settings.dimmableStates = gPrefsSettings.getUChar("dimStates", DIMMABLE_STATES);
+	settings.dimmableStates = gPrefsSettings.getUChar("dimStates", 50); // DIMMABLE_STATES
+	if (settings.dimmableStates == 0) {
+		// avoid division by zero (used as a divisor throughout Led.cpp's animations)
+		settings.dimmableStates = 50;
+	}
 
-	// get hui start/end from NVS
-	settings.progressHueStart = gPrefsSettings.getShort("hueStart", PROGRESS_HUE_START);
-	settings.progressHueEnd = gPrefsSettings.getShort("hueEnd", PROGRESS_HUE_END);
+	// get hue start/end from NVS
+	settings.progressHueStart = gPrefsSettings.getShort("hueStart", 85); // PROGRESS_HUE_START
+	settings.progressHueEnd = gPrefsSettings.getShort("hueEnd", -1); // PROGRESS_HUE_END
+	// get atmo light from NVS
+	settings.atmoHue = gPrefsSettings.getShort("hueAtmo", 10); // ATMO_HUE
+	settings.atmoSaturation = gPrefsSettings.getShort("satAtmo", 180); // ATMO_SATURATION
 
 	// get reverse rotation from NVS
-	#ifdef NEOPIXEL_REVERSE_ROTATION
-	const bool defReverseRotation = true;
-	#else
-	const bool defReverseRotation = false;
-	#endif
-	settings.neopixelReverseRotation = gPrefsSettings.getBool("ledReverseRot", defReverseRotation);
+	settings.neopixelReverseRotation = gPrefsSettings.getBool("ledReverseRot", false); // NEOPIXEL_REVERSE_ROTATION
 
 	// get LED offset from NVS
-	#ifdef LED_OFFSET
-	const uint8_t defLedOffset = LED_OFFSET;
-	#else
-	const uint8_t defLedOffset = 0;
-	#endif
-	settings.ledOffset = gPrefsSettings.getUChar("ledOffset", defLedOffset);
+	settings.ledOffset = gPrefsSettings.getUChar("ledOffset", 0); // LED_OFFSET
 	if (settings.ledOffset >= settings.numIndicatorLeds) {
 		Log_Println("ledOffset must be between 0 and numIndicatorLeds-1", LOGLEVEL_ERROR);
 		return false;
 	}
 	// load control colors from NVS
-	settings.controlLedColors = CONTROL_LEDS_COLORS;
+	settings.controlLedColors = {}; // CONTROL_LEDS_COLORS
 	if ((settings.numControlLeds > 0) && gPrefsSettings.isKey("controlColors")) {
 		size_t keySize = gPrefsSettings.getBytesLength("controlColors");
 		if (keySize == (settings.numControlLeds * sizeof(uint32_t))) {
@@ -179,6 +216,19 @@ void Led_Indicate(LedIndicatorType value) {
 #endif
 }
 
+// Deliberately hooked to an *accepted* tag rather than to the reader detecting one: in
+// pauseIfRfidRemoved-mode a card resting on the antenna can be re-detected when a poll is lost to RF
+// noise, which would otherwise flash the ring at random. Such a re-detection never reaches the card
+// queue (RfidMfrc522.cpp keeps it as a silent play/pause), so hooking in here makes it invisible.
+void Led_IndicateRfidTagAccepted(void) {
+#ifdef NEOPIXEL_ENABLE
+	if (!gLedSettings.indicateRfidTag) {
+		return;
+	}
+	Led_Indicate(LedIndicatorType::Ok);
+#endif
+}
+
 void Led_SetPause(boolean value) {
 #ifdef NEOPIXEL_ENABLE
 	gLedSettings.Led_Pause = value;
@@ -224,43 +274,59 @@ void Led_SetBrightness(uint8_t value) {
 	#endif
 
 	#ifdef MQTT_ENABLE
-	publishMqtt(topicLedBrightnessState, static_cast<uint32_t>(gLedSettings.Led_Brightness), false);
+	publishMqtt(topicLedBrightness, static_cast<uint32_t>(gLedSettings.Led_Brightness), false);
 	#endif
 #endif
 }
 
-void Led_SetNightmode(bool enabled) {
+// Only called by System_SetNightmode() on an actual state change, so saving the previous brightness
+// unconditionally is safe -- see Led.h.
+void Led_ApplyNightmode(bool enabled) {
 #ifdef NEOPIXEL_ENABLE
-	if (gLedSettings.Led_NightMode == enabled) {
-		// we don't need to do anything
-		return;
-	}
-
 	const char *msg = ledsBrightnessRestored;
-	uint8_t newValue = Led_savedBrightness;
+	uint8_t newValue = Led_savedBrightnessNightmode;
 	if (enabled) {
 		// we are switching to night mode
-		Led_savedBrightness = gLedSettings.Led_Brightness;
+		Led_savedBrightnessNightmode = gLedSettings.Led_Brightness;
 		msg = ledsDimmedToNightmode;
 		newValue = gLedSettings.Led_NightBrightness;
 	}
-	gLedSettings.Led_NightMode = enabled;
 	Led_SetBrightness(newValue);
 	Log_Println(msg, LOGLEVEL_INFO);
 #endif
 }
 
-bool Led_GetNightmode() {
+void Led_SetAmbientLight(bool enabled) {
 #ifdef NEOPIXEL_ENABLE
-	return gLedSettings.Led_NightMode;
+	if (gLedSettings.Led_AmbientLight == enabled) {
+		// we don't need to do anything
+		return;
+	}
+
+	if (enabled) {
+		gLedSettings.Led_AmbientLight = true;
+		Led_savedBrightnessAmbient = gLedSettings.Led_Brightness;
+		Led_SetBrightness(gLedSettings.Led_AmbientBrightness);
+		gPrefsSettings.putBool("atmoActive", true);
+	} else {
+		gLedSettings.Led_AmbientLight = false;
+		Led_SetBrightness(Led_savedBrightnessAmbient);
+		gPrefsSettings.putBool("atmoActive", false);
+	}
+#endif
+}
+
+bool Led_GetAmbientLight() {
+#ifdef NEOPIXEL_ENABLE
+	return gLedSettings.Led_AmbientLight;
 #else
 	return false;
 #endif
 }
 
-void Led_ToggleNightmode() {
+void Led_ToggleAmbientLight() {
 #ifdef NEOPIXEL_ENABLE
-	Led_SetNightmode(!gLedSettings.Led_NightMode);
+	Led_SetAmbientLight(!gLedSettings.Led_AmbientLight);
 #endif
 }
 
@@ -345,7 +411,6 @@ bool CheckForPowerButtonAnimation() {
 #ifdef NEOPIXEL_ENABLE
 static void Led_Task(void *parameter) {
 	static uint8_t lastLedBrightness = gLedSettings.Led_Brightness;
-	static CRGB *leds = nullptr;
 	static CRGBSet *indicator = nullptr;
 
 	uint8_t numIndicatorLeds = gLedSettings.numIndicatorLeds;
@@ -372,14 +437,17 @@ static void Led_Task(void *parameter) {
 			Led_LoadSettings(gLedSettings);
 			// number of indicator/control leds changed
 			if (((gLedSettings.numIndicatorLeds + gLedSettings.numControlLeds) != (numIndicatorLeds + numControlLeds)) || (gLedSettings.numControlLeds != numControlLeds)) {
-				FastLED.clear(true);
-				numIndicatorLeds = gLedSettings.numIndicatorLeds;
-				numControlLeds = gLedSettings.numControlLeds;
-				delete (leds);
-				delete (indicator);
-				leds = new CRGB[numIndicatorLeds + numControlLeds];
-				indicator = new CRGBSet(leds, numIndicatorLeds);
-				FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, numIndicatorLeds + numControlLeds).setCorrection(TypicalSMD5050);
+				// FastLED's SPI/RMT WS2812 driver lazily creates its internal strip object,
+				// sized for whatever pixel count was in effect on the very first show() call,
+				// and never resizes it afterwards. Calling addLeds() again with a different
+				// count here doesn't reset that internal state, so every following show()
+				// call hits a hard FASTLED_ASSERT (mLedStrip->numPixels() != pixels.size()).
+				// Request a clean restart instead of trying to hot-reallocate the strip, and
+				// stop touching leds/indicator/FastLED until then (their sizes no longer
+				// match gLedSettings).
+				Log_Println("Number of LEDs changed, restarting to apply..", LOGLEVEL_NOTICE);
+				System_Restart();
+				vTaskDelay(portMAX_DELAY);
 			}
 		}
 
@@ -409,6 +477,8 @@ static void Led_Task(void *parameter) {
 		} else if (LED_INDICATOR_IS_SET(LedIndicatorType::VoltageWarning)) {
 			LED_INDICATOR_CLEAR(LedIndicatorType::VoltageWarning);
 			nextAnimation = LedAnimationType::VoltageWarning;
+		} else if (Led_DownloadActive) {
+			nextAnimation = LedAnimationType::Download;
 		} else if (LED_INDICATOR_IS_SET(LedIndicatorType::Voltage)) {
 			nextAnimation = LedAnimationType::BatteryMeasurement;
 		} else if (LED_INDICATOR_IS_SET(LedIndicatorType::VolumeChange)) {
@@ -453,84 +523,105 @@ static void Led_Task(void *parameter) {
 			lastLedBrightness = gLedSettings.Led_Brightness;
 		}
 
-		// when there is no delay anymore we have to animate something
-		if (animationTimer <= 0) {
-			AnimationReturnType ret;
-			// animate the current animation
-			switch (activeAnimation) {
-				case LedAnimationType::Boot:
-					ret = Animation_Boot(startNewAnimation, *indicator);
-					break;
+		if (!gLedSettings.Led_AmbientLight || (activeAnimation == LedAnimationType::Shutdown)) {
 
-				case LedAnimationType::Shutdown:
-					ret = Animation_Shutdown(startNewAnimation, *indicator);
-					break;
+			// when there is no delay anymore we have to animate something
+			if (animationTimer <= 0) {
+				AnimationReturnType ret;
+				// animate the current animation
+				switch (activeAnimation) {
+					case LedAnimationType::Boot:
+						ret = Animation_Boot(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Error:
-					ret = Animation_Error(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Shutdown:
+						ret = Animation_Shutdown(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Ok:
-					ret = Animation_Ok(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Error:
+						ret = Animation_Error(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Volume:
-					ret = Animation_Volume(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Ok:
+						ret = Animation_Ok(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::VoltageWarning:
-					ret = Animation_VoltageWarning(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Volume:
+						ret = Animation_Volume(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::BatteryMeasurement:
-					ret = Animation_BatteryMeasurement(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::VoltageWarning:
+						ret = Animation_VoltageWarning(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Rewind:
-					ret = Animation_Rewind(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::BatteryMeasurement:
+						ret = Animation_BatteryMeasurement(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Playlist:
-					ret = Animation_PlaylistProgress(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Rewind:
+						ret = Animation_Rewind(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Idle:
-					ret = Animation_Idle(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Playlist:
+						ret = Animation_PlaylistProgress(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Busy:
-					ret = Animation_Busy(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Idle:
+						ret = Animation_Idle(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Speech:
-					ret = Animation_Speech(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Busy:
+						ret = Animation_Busy(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Pause:
-					ret = Animation_Pause(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Speech:
+						ret = Animation_Speech(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Progress:
-					ret = Animation_Progress(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Pause:
+						ret = Animation_Pause(startNewAnimation, *indicator);
+						break;
 
-				case LedAnimationType::Webstream:
-					ret = Animation_Webstream(startNewAnimation, *indicator);
-					break;
+					case LedAnimationType::Progress:
+						ret = Animation_Progress(startNewAnimation, *indicator);
+						break;
 
-				default:
-					*indicator = CRGB::Black;
+					case LedAnimationType::Download:
+						ret = Animation_Download(startNewAnimation, *indicator);
+						break;
+
+					case LedAnimationType::Webstream:
+						ret = Animation_Webstream(startNewAnimation, *indicator);
+						break;
+
+					default:
+						*indicator = CRGB::Black;
+						FastLED.show();
+						ret.animationActive = false;
+						ret.animationDelay = 50;
+						break;
+				}
+				// apply delay and state from animation
+				animationActive = ret.animationActive;
+				animationTimer = ret.animationDelay;
+				if (ret.animationRefresh) {
 					FastLED.show();
-					ret.animationActive = false;
-					ret.animationDelay = 50;
-					break;
+				}
 			}
-			// apply delay and state from animation
-			animationActive = ret.animationActive;
-			animationTimer = ret.animationDelay;
-			if (ret.animationRefresh) {
-				FastLED.show();
+		} else {
+			// ambient light mode
+			*indicator = CRGB::Black;
+			if (gLedSettings.numIndicatorLeds == 1) {
+				leds[0].setHSV(gLedSettings.atmoHue, gLedSettings.atmoSaturation, 255);
+			} else {
+				for (uint8_t i = 0; i < gLedSettings.numIndicatorLeds; i++) {
+					leds[i].setHSV(gLedSettings.atmoHue, gLedSettings.atmoSaturation, 255);
+				}
 			}
+			FastLED.show();
+			activeAnimation = LedAnimationType::NoNewAnimation;
+			animationActive = false;
+			animationTimer = 0;
 		}
 
 		// get the time to wait and delay the task
@@ -543,8 +634,8 @@ static void Led_Task(void *parameter) {
 		animationTimer -= taskDelay;
 		vTaskDelay(portTICK_PERIOD_MS * taskDelay);
 	}
-	delete (leds);
-	delete (indicator);
+	delete[] leds;
+	delete indicator;
 	vTaskDelete(NULL);
 }
 #endif
@@ -964,12 +1055,28 @@ AnimationReturnType Animation_Progress(const bool startNewAnimation, CRGBSet &le
 	int32_t animationDelay = 0;
 	// static values
 	static double lastPos = 0.0f;
+	static bool lastPreviewActive = false;
+	static uint8_t lastPreviewTarget = 0;
 
-	if (gPlayProperties.currentRelPos != lastPos || startNewAnimation) {
+	// CMD_SEEK_PREVIEW rotary gesture (RotaryEncoder.cpp/AudioPlayer.cpp): while active, the ring shows
+	// a not-yet-committed target instead of the actual (unchanged) playback position -- read via these
+	// accessors rather than gPlayProperties.currentRelPos, which must not reflect the preview before commit.
+	const bool previewActive = AudioPlayer_IsSeekPreviewActive();
+	const uint8_t previewTarget = AudioPlayer_GetSeekPreviewTargetPercent();
+
+	if (gPlayProperties.currentRelPos != lastPos || previewActive != lastPreviewActive || (previewActive && (previewTarget != lastPreviewTarget)) || startNewAnimation) {
 		lastPos = gPlayProperties.currentRelPos;
+		lastPreviewActive = previewActive;
+		lastPreviewTarget = previewTarget;
 		leds = CRGB::Black;
 		if (gLedSettings.numIndicatorLeds == 1) {
-			leds[0].setHue((uint8_t) (85 - ((double) 90 / 100) * gPlayProperties.currentRelPos));
+			if (previewActive) {
+				// A single LED can't show ring-position and cursor separately -- solid blue is an
+				// unambiguous "preview active" signal, at the cost of not showing the target itself.
+				leds[0] = CRGB::Blue;
+			} else {
+				leds[0].setHue((uint8_t) (85 - ((double) 90 / 100) * gPlayProperties.currentRelPos));
+			}
 		} else {
 			const uint32_t ledValue = std::clamp<uint32_t>(map(gPlayProperties.currentRelPos, 0, 98, 0, leds.size() * gLedSettings.dimmableStates), 0, leds.size() * gLedSettings.dimmableStates);
 			const uint8_t fullLeds = ledValue / gLedSettings.dimmableStates;
@@ -977,6 +1084,8 @@ AnimationReturnType Animation_Progress(const bool startNewAnimation, CRGBSet &le
 			for (uint8_t led = 0; led < fullLeds; led++) {
 				if (System_AreControlsLocked()) {
 					leds[Led_Address(led)] = CRGB::Red;
+				} else if (previewActive) {
+					leds[Led_Address(led)] = CRGB::Yellow;
 				} else if (!gPlayProperties.pausePlay) { // Hue-rainbow
 					leds[Led_Address(led)].setHue((uint8_t) (((float) gLedSettings.progressHueEnd - (float) gLedSettings.progressHueStart) / (leds.size() - 1) * led + gLedSettings.progressHueStart));
 				}
@@ -984,10 +1093,52 @@ AnimationReturnType Animation_Progress(const bool startNewAnimation, CRGBSet &le
 			if (lastLed > 0) {
 				if (System_AreControlsLocked()) {
 					leds[Led_Address(fullLeds)] = CRGB::Red;
+				} else if (previewActive) {
+					leds[Led_Address(fullLeds)] = CRGB::Yellow;
 				} else {
 					leds[Led_Address(fullLeds)].setHue((uint8_t) (((float) gLedSettings.progressHueEnd - (float) gLedSettings.progressHueStart) / (leds.size() - 1) * fullLeds + gLedSettings.progressHueStart));
 				}
 				leds[Led_Address(fullLeds)] = Led_DimColor(leds[Led_Address(fullLeds)], lastLed);
+			}
+			if (previewActive) {
+				// Cursor is drawn last so it overrides whatever the ring fill just put at that position.
+				const uint32_t cursorValue = std::clamp<uint32_t>(map(previewTarget, 0, 100, 0, leds.size() * gLedSettings.dimmableStates), 0, leds.size() * gLedSettings.dimmableStates);
+				const uint8_t cursorLed = std::min<uint8_t>(cursorValue / gLedSettings.dimmableStates, leds.size() - 1);
+				const uint8_t cursorSub = cursorValue % gLedSettings.dimmableStates;
+				leds[Led_Address(cursorLed)] = (cursorSub > 0) ? Led_DimColor(CRGB::Blue, cursorSub) : CRGB::Blue;
+			}
+		}
+		animationDelay = 10;
+	}
+	return AnimationReturnType(false, animationDelay, true);
+}
+
+// --------------------------------
+// MediaHub Download Progress Animation
+// --------------------------------
+// Own, non-suspending animation (concept §12): unlike Led_ShowOtaProgress(),
+// this goes through the normal Led_Task priority ladder instead of
+// suspending it, so e.g. an error/voltage-warning can still interrupt it.
+// Fill level comes from Led_SetDownloadProgress(), driven by MediaHub.
+AnimationReturnType Animation_Download(const bool startNewAnimation, CRGBSet &leds) {
+	int32_t animationDelay = 0;
+	static uint16_t lastPercent = 0xFFFF; // force first draw
+
+	if (Led_DownloadPercent != lastPercent || startNewAnimation) {
+		lastPercent = Led_DownloadPercent;
+		leds = CRGB::Black;
+		if (gLedSettings.numIndicatorLeds == 1) {
+			leds[0] = CRGB::DeepSkyBlue;
+			leds[0].nscale8((uint8_t) map(Led_DownloadPercent, 0, 100, 40, 255));
+		} else {
+			const uint32_t ledValue = std::clamp<uint32_t>(map(Led_DownloadPercent, 0, 100, 0, leds.size() * gLedSettings.dimmableStates), 0, leds.size() * gLedSettings.dimmableStates);
+			const uint8_t fullLeds = ledValue / gLedSettings.dimmableStates;
+			const uint8_t lastLed = ledValue % gLedSettings.dimmableStates;
+			for (uint8_t led = 0; led < fullLeds; led++) {
+				leds[Led_Address(led)] = CRGB::DeepSkyBlue;
+			}
+			if (lastLed > 0 && fullLeds < leds.size()) {
+				leds[Led_Address(fullLeds)] = Led_DimColor(CRGB::DeepSkyBlue, lastLed);
 			}
 		}
 		animationDelay = 10;
@@ -1009,7 +1160,7 @@ AnimationReturnType Animation_Volume(const bool startNewAnimation, CRGBSet &leds
 	static uint16_t cyclesWaited = 0;
 
 	// wait for further volume changes within next 20ms for 50 cycles = 1s
-	const uint32_t ledValue = std::clamp<uint32_t>(map(AudioPlayer_GetCurrentVolume(), 0, AudioPlayer_GetMaxVolume(), 0, leds.size() * gLedSettings.dimmableStates), 0, leds.size() * gLedSettings.dimmableStates);
+	const uint32_t ledValue = std::clamp<uint32_t>(map(AudioPlayer_GetCurrentVolume(), AudioPlayer_GetMinVolume(), AudioPlayer_GetMaxVolume(), 0, leds.size() * gLedSettings.dimmableStates), 0, leds.size() * gLedSettings.dimmableStates);
 	const uint8_t fullLeds = ledValue / gLedSettings.dimmableStates;
 	const uint8_t lastLed = ledValue % gLedSettings.dimmableStates;
 
@@ -1236,13 +1387,59 @@ AnimationReturnType Animation_BatteryMeasurement(const bool startNewAnimation, C
 
 void Led_TaskPause(void) {
 #ifdef NEOPIXEL_ENABLE
-	vTaskSuspend(Led_TaskHandle);
-	FastLED.clear(true);
+	if (Led_TaskHandle != NULL) {
+		vTaskSuspend(Led_TaskHandle);
+		FastLED.clear(true);
+	}
 #endif
 }
 
 void Led_TaskResume(void) {
 #ifdef NEOPIXEL_ENABLE
-	vTaskResume(Led_TaskHandle);
+	if (Led_TaskHandle != NULL) {
+		vTaskResume(Led_TaskHandle);
+	}
+#endif
+}
+
+// Feeds the Download animation's priority check and fill level (concept §12);
+// pure state, picked up by Led_Task on its next iteration.
+void Led_SetDownloadProgress(bool active, uint8_t percent) {
+#ifdef NEOPIXEL_ENABLE
+	Led_DownloadActive = active;
+	Led_DownloadPercent = percent;
+#endif
+}
+
+// Shows OTA-update progress on the indicator LEDs while Led_Task is suspended (see
+// Led_TaskPause(), called from System_PauseTasksDuringUpload()). No-op if Neopixel is
+// disabled or the strip hasn't been initialized yet. With a single indicator LED (which
+// can't show a fill level), blinks it instead, matching how other animations handle that case.
+void Led_ShowOtaProgress(uint8_t percent) {
+#ifdef NEOPIXEL_ENABLE
+	if ((leds == nullptr) || (gLedSettings.numIndicatorLeds == 0)) {
+		return;
+	}
+	if (percent > 100) {
+		percent = 100;
+	}
+	if (gLedSettings.numIndicatorLeds == 1) {
+		// a single LED can't show a fill level; blink it instead, like other single-LED animations
+		static uint32_t lastToggle = 0;
+		static bool blinkOn = false;
+		const uint32_t now = millis();
+		if (now - lastToggle >= 250) {
+			lastToggle = now;
+			blinkOn = !blinkOn;
+		}
+		leds[0] = blinkOn ? CRGB::Blue : CRGB::Black;
+		FastLED.show();
+		return;
+	}
+	const uint8_t litCount = (uint8_t) (((uint16_t) percent * gLedSettings.numIndicatorLeds) / 100);
+	for (uint8_t i = 0; i < gLedSettings.numIndicatorLeds; i++) {
+		leds[i] = (i < litCount) ? CRGB::Blue : CRGB::Black;
+	}
+	FastLED.show();
 #endif
 }

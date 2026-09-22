@@ -9,7 +9,7 @@
 	PCB: https://forum.espuino.de/t/espuino-complete/3817
 	Infos: ESP32-WROVER-E 16MB, buck-boost-converter TPS63000, voltage-monitoring SGM809, port-expander, MAX98357a, TP5000 (LiPo + LiFePO4-support)
 	Caveats: Don't forget to verify polarity of your battery-connector. It needs to fit the polarity printed on the PCB!
-	Settings: Make sure to enable at least PORT_EXPANDER_ENABLE. PLAY_MONO_SPEAKER should be disabled.
+	Settings: Make sure to enable at least PORT_EXPANDER_ENABLE.
 	Status: Tested
 	*/
 
@@ -39,7 +39,7 @@
 	#define RFID_SCK                        18		// GPIO for clock-signal (RFID)
 
 	// RFID (PN5180 only; not necessary for RC522)
-	#ifdef RFID_READER_TYPE_PN5180
+	#if defined(RFID_READER_TYPE_RUNTIME)
 		#define RFID_BUSY					33		// PN5180 BUSY PIN
 		#define RFID_RST					22		// PN5180 RESET PIN
 		#define RFID_IRQ					32		// PN5180 IRQ PIN (only needed for low power card detection)
@@ -106,7 +106,7 @@
 	// (optional) Monitoring of battery-voltage via ADC
 	#ifdef MEASURE_BATTERY_VOLTAGE
 		#define VOLTAGE_READ_PIN			35				// GPIO used to monitor battery-voltage.
-		constexpr float offsetVoltage = -0.04;		// If voltage measured by ESP isn't 100% accurate, you can add a correction-value here
+		constexpr float s_offsetVoltage = -0.04;		// DEFAULT ONLY - the correction is configured in the web UI (General -> Battery) and stored in NVS. This value is just the first-boot seed / fallback.
 		constexpr uint16_t rdiv1 = 300;				// Rdiv1 of voltage-divider (kOhms)
 		constexpr uint16_t rdiv2 = 100;				// Rdiv2 of voltage-divider (kOhms) => used to measure voltage via ADC!
 		constexpr adc_attenuation_t inputAttenuation = ADC_0db;		// ADC_0db (0.1->0.95V) // ADC_2_5db (0.1->1.25V) // ADC_6db (0.15->1.75V) // ADC_11db (0.14->2.45V)

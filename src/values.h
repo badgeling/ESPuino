@@ -36,6 +36,7 @@
 #define WEBSTREAM												  8 // Play webradio-stream
 #define LOCAL_M3U												  11 // Plays items (webstream or files) with addresses/paths from a local m3u-file
 #define BUSY													  10 // Used if playlist is created
+#define MEDIAHUB												  18 // Card is managed by an external MediaHub (see mediahub-konzept.md); real playMode comes from its manifest, not from here
 
 // RFID-modifcation-types
 #define CMD_NOTHING						 0 // Do Nothing
@@ -57,6 +58,9 @@
 #define CMD_ENABLE_FTP_SERVER			 150 // Enables FTP-server
 #define CMD_TELL_IP_ADDRESS				 151 // Command: ESPuino announces its IP-address via speech
 #define CMD_TELL_CURRENT_TIME			 152 // Command: ESPuino announces current time via speech
+#define CMD_TOGGLE_AMBIENT_LIGHT		 153 // Command: toggles the ambient light
+#define CMD_BRIGHTNESS_UP				 154 // Command: raise LED-brightness by one step
+#define CMD_BRIGHTNESS_DOWN				 155 // Command: lower LED-brightness by one step
 
 #define CMD_PLAYPAUSE	   170 // Command: play/pause
 #define CMD_PREVTRACK	   171 // Command: previous track
@@ -68,12 +72,13 @@
 #define CMD_VOLUMEDOWN	   177 // Command: lower volume by 1
 #define CMD_MEASUREBATTERY 178 // Command: Measure battery-voltage
 #define CMD_SLEEPMODE	   179 // Command: Go to deepsleep
-#define CMD_SEEK_FORWARDS  180 // Command: jump forwards (time period to jump (in seconds) is configured via settings.h: jumpOffset)
-#define CMD_SEEK_BACKWARDS 181 // Command: jump backwards (time period to jump (in seconds) is configured via settings.h: jumpOffset)
+#define CMD_SEEK_FORWARDS  180 // Command: jump forwards (seconds per press: web interface, NVS "jumpOffset")
+#define CMD_SEEK_BACKWARDS 181 // Command: jump backwards (seconds per press: web interface, NVS "jumpOffset")
 #define CMD_STOP		   182 // Command: stops playback
 #define CMD_RESTARTSYSTEM  183 // Command: restart System
 #define CMD_NEXTFOLDER	   184 // Command: jump forwards to next folder (only applicable for recursive playmodes)
 #define CMD_PREVFOLDER	   185 // Command: jump forwards to previous folder (only applicable for recursive playmodes)
+#define CMD_SEEK_PREVIEW   186 // Command: rotary-gesture-only. Turning previews a target position (LED cursor); commits on release/idle instead of jumping immediately
 
 #define CMD_VIRTUAL_RFID_CARD_01 241 // Command: Virtual RFID-Card 900000000001
 #define CMD_VIRTUAL_RFID_CARD_02 242 // Command: Virtual RFID-Card 900000000002
@@ -85,6 +90,14 @@
 #define CMD_VIRTUAL_RFID_CARD_08 248 // Command: Virtual RFID-Card 900000000008
 #define CMD_VIRTUAL_RFID_CARD_09 249 // Command: Virtual RFID-Card 900000000009
 #define CMD_VIRTUAL_RFID_CARD_10 250 // Command: Virtual RFID-Card 900000000010
+
+// Seek step sizes (seconds). These are internal defaults only: they seed the matching
+// web-interface settings before their first save and are read from NVS afterwards.
+// Change the values in the web interface, not here.
+#define SEEK_STEP_BUTTON_DEFAULT 30 // NVS "jumpOffset":  per press of CMD_SEEK_FORWARDS / CMD_SEEK_BACKWARDS
+#define SEEK_STEP_ROTARY_DEFAULT 10 // NVS "rotSeekStep": per encoder detent when a turn action is mapped to seek.
+									// Deliberately smaller than the button step: a flick of the encoder is many
+									// detents at once, so reusing the button step there would scrub minutes.
 
 // Repeat-Modes
 #define NO_REPEAT		 0 // No repeat

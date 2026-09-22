@@ -8,6 +8,13 @@
 	#define AUDIOPLAYER_PLAYLIST_SORT_MODE_DEFAULT playlistSortMode::STRNATCASECMP
 #endif
 
+#define AUDIOPLAYER_VOLUME_MAX	21u
+#define AUDIOPLAYER_VOLUME_MIN	0u
+#define AUDIOPLAYER_VOLUME_INIT 3u
+// Headroom the night-mode volume limit leaves above the volume that was in effect when night mode
+// started, so an audiobook that turns out a touch too quiet can still be nudged up one step.
+#define AUDIOPLAYER_NIGHT_VOLUME_HEADROOM 1u
+
 enum class playlistSortMode : uint8_t {
 	STRCMP = 1,
 	STRNATCMP = 2,
@@ -25,7 +32,6 @@ typedef struct { // Bit field
 	double currentRelPos; // Current relative playPosition (in %)
 	bool sleepAfterCurrentTrack : 1; // If uC should go to sleep after current track
 	bool sleepAfterPlaylist		: 1; // If uC should go to sleep after whole playlist
-	bool sleepAfter5Tracks		: 1; // If uC should go to sleep after 5 tracks
 	bool saveLastPlayPosition	: 1; // If playposition/current track should be saved (for AUDIOBOOK)
 	char playRfidTag[13]; // ID of RFID-tag that started playlist
 	bool pausePlay				 : 1; // If pause is active
@@ -36,13 +42,15 @@ typedef struct { // Bit field
 	bool newPlayMono			 : 1; // true if mono; false if stereo (helper)
 	bool currentPlayMono		 : 1; // true if mono; false if stereo
 	bool isWebstream			 : 1; // Indicates if track currenty played is a webstream
+	bool announcementActive		 : 1; // An announcement is interrupting playback (see AudioPlayer_PlayAnnouncement)
 	uint8_t tellMode			 : 2; // Tell mode for text to speech announcments
 	bool currentSpeechActive	 : 1; // If speech-play is active
 	bool lastSpeechActive		 : 1; // If speech-play was active
 	bool SavePlayPosRfidChange	 : 1; // Save last play-position
 	bool pauseOnMinVolume		 : 1; // When playback is active and volume is changed to zero, playback is paused automatically.
 	bool pauseIfRfidRemoved		 : 1; // When playback is active and RFID is removed, playback is paused automatically.
-	bool dontAcceptRfidTwice	 : 1; // RFID-reader doesn't accept the same RFID-tag twice in a row (unless it's a modification-card or RFID-tag is unknown in NVS). Flag will be ignored silently if PAUSE_WHEN_RFID_REMOVED is active. (https://forum.espuino.de/t/neues-feature-dont-accept-same-rfid-twice/1247)
+	bool dontAcceptRfidTwice	 : 1; // RFID-reader doesn't accept the same RFID-tag twice in a row (unless it's a modification-card or RFID-tag is unknown in NVS). Flag will be ignored silently if pauseIfRfidRemoved is active. (https://forum.espuino.de/t/neues-feature-dont-accept-same-rfid-twice/1247)
+	bool resumeOnSameRfid		 : 1; // If pause is active and same RFID is put on again, playback continues (only effective if dontAcceptRfidTwice is enabled)
 	int16_t jumpToFolderTrack = -1; // track to jump to
 	int8_t gainLowPass = 0; // Low Pass for EQ Control
 	int8_t gainBandPass = 0; // Band Pass for EQ Control
@@ -50,22 +58,37 @@ typedef struct { // Bit field
 	size_t coverFilePos; // current cover file position
 	size_t coverFileSize; // current cover file size
 	size_t audioFileDuration; // file duration of current audio file (in seconds)
+	uint16_t savePosIntervalSecs = 0; // periodic play-position checkpoint interval in seconds (0 = disabled)
 } playProps;
 
 extern playProps gPlayProperties;
 
-void Audio_TaskPause(void);
-void Audio_TaskResume(void);
+void AudioPlayer_NotifyUploadStart(void);
+void AudioPlayer_NotifyUploadEnd(void);
 
 void AudioPlayer_Init(void);
 void AudioPlayer_Exit(void);
 void AudioPlayer_Cyclic(void);
 void AudioPlayer_Loop(void);
 uint8_t AudioPlayer_GetRepeatMode(void);
-void AudioPlayer_SetVolume(const int32_t _newVolume, bool reAdjustRotary);
+void AudioPlayer_SetVolume(const int32_t _newVolume);
 void AudioPlayer_SetEqualizer(const int8_t gainLowPass, const int8_t gainBandPass, const int8_t gainHighPass);
 void AudioPlayer_SetPlaylist(const char *_itemToPlay, const uint32_t _lastPlayPos, const uint32_t _playMode, const uint16_t _trackLastPlayed);
 void AudioPlayer_SetTrackControl(const uint8_t trackCommand);
+// Queue a relative seek. Accumulates, so one call per rotary detent scrubs proportionally.
+void AudioPlayer_AddSeekOffset(const int16_t seconds);
+// Seek-preview (CMD_SEEK_PREVIEW rotary gesture): moves a not-yet-committed target position instead of
+// jumping immediately; commits via the existing SEEK_POS_PERCENT path (see RotaryEncoder.cpp).
+void AudioPlayer_SeekPreviewStart(void);
+void AudioPlayer_SeekPreviewAdjust(const int32_t detents);
+void AudioPlayer_SeekPreviewCommit(void);
+void AudioPlayer_SeekPreviewCancel(void);
+bool AudioPlayer_IsSeekPreviewActive(void);
+uint8_t AudioPlayer_GetSeekPreviewTargetPercent(void);
+// Arm the "don't accept same RFID twice"-lock to be released on the next idle-state. Called when a tag is
+// accepted, independent of whether playback actually starts, so a tag whose first track fails immediately
+// (e.g. a webstream without WiFi) does not stay locked forever.
+void AudioPlayer_ArmRfidResetOnIdle(void);
 void AudioPlayer_PauseOnMinVolume(const uint8_t oldVolume, const uint8_t newVolume);
 
 playlistSortMode AudioPlayer_GetPlaylistSortMode(void);
@@ -77,11 +100,23 @@ uint8_t AudioPlayer_GetMaxVolume(void);
 void AudioPlayer_SetMaxVolume(uint8_t value);
 uint8_t AudioPlayer_GetMaxVolumeSpeaker(void);
 void AudioPlayer_SetMaxVolumeSpeaker(uint8_t value);
+void AudioPlayer_ApplyMaxVolumes(uint8_t speaker, uint8_t headphone);
+// Night-mode volume limit: when night mode starts, the volume in effect becomes a temporary ceiling
+// (plus AUDIOPLAYER_NIGHT_VOLUME_HEADROOM) that is lifted again when night mode ends. Driven by
+// System_SetNightmode(); does nothing unless the user enabled the limit in the web interface.
+void AudioPlayer_ApplyNightVolumeCap(bool enabled);
+void AudioPlayer_SetNightVolumeLimitEnabled(bool enabled);
 uint8_t AudioPlayer_GetMinVolume(void);
 void AudioPlayer_SetMinVolume(uint8_t value);
 uint8_t AudioPlayer_GetInitVolume(void);
 void AudioPlayer_SetInitVolume(uint8_t value);
 void AudioPlayer_SetupVolumeAndAmps(void);
+// Interrupts playback to play a single local file (e.g. "battery low"), then returns to the exact
+// position it interrupted. The playlist, track number and play mode are left untouched, and while the
+// announcement runs nothing about it is reported to the web interface or MQTT -- from the outside the
+// interruption is invisible. Returns false (and changes nothing) when there is nothing to interrupt,
+// the file is missing, or it cannot be opened. Call from the main loop task, like AudioPlayer_Cyclic().
+bool AudioPlayer_PlayAnnouncement(const char *path);
 bool Audio_Detect_Mode_HP(bool _state);
 void Audio_setTitle(const char *format, ...);
 time_t AudioPlayer_GetPlayTimeSinceStart(void);

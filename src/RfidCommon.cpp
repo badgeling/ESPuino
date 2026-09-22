@@ -4,26 +4,26 @@
 #include "AudioPlayer.h"
 #include "Cmd.h"
 #include "Common.h"
+#include "Led.h"
 #include "Log.h"
+#include "MediaHub.h"
 #include "MemX.h"
 #include "Mqtt.h"
 #include "Queues.h"
 #include "Rfid.h"
+#include "RfidConfig.h"
 #include "System.h"
 #include "Web.h"
+
+#include <atomic>
 
 unsigned long Rfid_LastRfidCheckTimestamp = 0;
 char gCurrentRfidTagId[cardIdStringSize] = ""; // No crap here as otherwise it could be shown in GUI
 char gOldRfidTagId[cardIdStringSize] = "X"; // Init with crap
 
-// check if we have RFID-reader enabled
-#if defined(RFID_READER_TYPE_MFRC522_SPI) || defined(RFID_READER_TYPE_MFRC522_I2C) || defined(RFID_READER_TYPE_PN5180)
-	#define RFID_READER_ENABLED 1
-#endif
-
 // Tries to lookup RFID-tag-string in NVS and extracts parameter from it if found
 void Rfid_PreferenceLookupHandler(void) {
-#if defined(RFID_READER_ENABLED)
+#if defined(RFID_READER_TYPE_RUNTIME)
 	BaseType_t rfidStatus;
 	char rfidTagId[cardIdStringSize];
 	char _file[255];
@@ -54,7 +54,8 @@ void Rfid_PreferenceLookupHandler(void) {
 		token = strtok((char *) s.c_str(), stringDelimiter);
 		while (token != NULL) { // Try to extract data from string after lookup
 			if (i == 1) {
-				strncpy(_file, token, sizeof(_file) / sizeof(_file[0]));
+				strncpy(_file, token, sizeof(_file) - 1);
+				_file[sizeof(_file) - 1] = '\0';
 			} else if (i == 2) {
 				_lastPlayPos = strtoul(token, NULL, 10);
 			} else if (i == 3) {
@@ -77,15 +78,29 @@ void Rfid_PreferenceLookupHandler(void) {
 			} else {
 				if (gPlayProperties.dontAcceptRfidTwice) {
 					if (strncmp(gCurrentRfidTagId, gOldRfidTagId, 12) == 0) {
+						// If pause is active, resume playback when the same RFID is put on again.
+						if (gPlayProperties.pausePlay && gPlayProperties.resumeOnSameRfid) {
+							Log_Printf(LOGLEVEL_INFO, "Same RFID while paused -> resume playback (%s)", gCurrentRfidTagId);
+							Led_IndicateRfidTagAccepted();
+							AudioPlayer_SetTrackControl(PAUSEPLAY);
+							return;
+						}
 						Log_Printf(LOGLEVEL_ERROR, dontAccepctSameRfid, gCurrentRfidTagId);
 						// System_IndicateError(); // Enable to have shown error @neopixel every time
 						return;
 					} else {
 						strncpy(gOldRfidTagId, gCurrentRfidTagId, 12);
+						// Arm the lock-reset now that a new tag was accepted. This must not depend on playback
+						// actually starting, otherwise a tag whose first track fails immediately stays locked forever.
+						AudioPlayer_ArmRfidResetOnIdle();
 					}
 				}
+				// Only here, past the dontAcceptRfidTwice dedup: a tag that was refused as a duplicate
+				// did not do anything, so it must not be acknowledged as if it had.
+				Led_IndicateRfidTagAccepted();
+
 	#ifdef MQTT_ENABLE
-				publishMqtt(topicRfidState, gCurrentRfidTagId, false);
+				publishMqtt(topicRfid, gCurrentRfidTagId, false);
 	#endif
 
 	#ifdef BLUETOOTH_ENABLE
@@ -95,7 +110,13 @@ void Rfid_PreferenceLookupHandler(void) {
 				}
 	#endif
 
-				AudioPlayer_SetPlaylist(_file, _lastPlayPos, _playMode, _trackLastPlayed);
+				if (_playMode == MEDIAHUB) {
+					// Dispatch to MediaHub before the normal AudioPlayer logic gets
+					// a chance to interpret _file (concept: mediahub-konzept.md §8).
+					MediaHub_HandleCardTapped(gCurrentRfidTagId, _file, _lastPlayPos, _trackLastPlayed);
+				} else {
+					AudioPlayer_SetPlaylist(_file, _lastPlayPos, _playMode, _trackLastPlayed);
+				}
 			}
 		}
 	}
@@ -106,18 +127,44 @@ void Rfid_ResetOldRfid() {
 	strncpy(gOldRfidTagId, "X", cardIdStringSize - 1);
 }
 
-#if defined(RFID_READER_ENABLED)
+// Set by Rfid_ResetLastTag(), consumed by the reader task. The reader's "same card re-applied"
+// buffer is task-local, so it can only be cleared from within the task itself.
+static std::atomic<bool> gResetLastTagRequested {false};
+
+// Forget the tag that was last seen/accepted, in both places that remember it: gOldRfidTagId (the
+// dontAcceptRfidTwice dedup) and the reader task's own last-card buffer (the pauseIfRfidRemoved dedup).
+// Call this whenever something *other than the reader* changes what a tag means -- an assignment being
+// written, deleted or restored, or playback being started from the web UI.
+//
+// Without this, re-applying a tag whose assignment just changed is short-circuited before the NVS lookup
+// ever happens: in pauseIfRfidRemoved-mode the reader turns it into a play/pause toggle on the playlist
+// that is still loaded, so the *old* book resumes. Both dedups live only in RAM, which is why a reboot or
+// a deep-sleep cycle appears to "fix" it.
+void Rfid_ResetLastTag() {
+	Rfid_ResetOldRfid();
+	gResetLastTagRequested.store(true, std::memory_order_relaxed);
+}
+
+bool Rfid_ConsumeLastTagReset() {
+	return gResetLastTagRequested.exchange(false, std::memory_order_relaxed);
+}
+
+#if defined(RFID_READER_TYPE_RUNTIME)
 extern TaskHandle_t rfidTaskHandle;
 #endif
 
 void Rfid_TaskPause(void) {
-#if defined(RFID_READER_ENABLED)
-	vTaskSuspend(rfidTaskHandle);
+#if defined(RFID_READER_TYPE_RUNTIME)
+	if (rfidTaskHandle != NULL) {
+		vTaskSuspend(rfidTaskHandle);
+	}
 #endif
 }
 void Rfid_TaskResume(void) {
-#if defined(RFID_READER_ENABLED)
-	Rfid_TaskReset(); // Reset state machine to initial state
-	vTaskResume(rfidTaskHandle);
+#if defined(RFID_READER_TYPE_RUNTIME)
+	if (rfidTaskHandle != NULL) {
+		Rfid_TaskReset(); // Reset state machine to initial state
+		vTaskResume(rfidTaskHandle);
+	}
 #endif
 }
